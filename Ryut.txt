@@ -1,0 +1,1335 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Databricks Schema-to-Schema Validation with Row Hash Drill-down
+# MAGIC
+# MAGIC Compares configured tables between two Databricks schemas.
+# MAGIC
+# MAGIC Features:
+# MAGIC - table row counts
+# MAGIC - schema/data-type classification
+# MAGIC - categorical count + distinct count
+# MAGIC - numerical min/max/sum/median
+# MAGIC - date/timestamp min/max with timezone reconciliation
+# MAGIC - optional row-hash validation for a configured volume
+# MAGIC - source-only / target-only / changed-record identification
+# MAGIC - mismatch column identification with source value, target value, and keys
+# MAGIC - CSV export for all reports
+# MAGIC
+# MAGIC Serverless compatible: no CACHE, PERSIST, or UNPERSIST.
+
+# COMMAND ----------
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timezone
+from functools import reduce
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 1. Interactive parameters
+
+# COMMAND ----------
+
+dbutils.widgets.text("source_catalog", "main")
+dbutils.widgets.text("source_schema", "")
+dbutils.widgets.text("target_catalog", "main")
+dbutils.widgets.text("target_schema", "")
+dbutils.widgets.text("table_list", "")
+
+# Per-table configuration:
+#
+# {
+#   "claims": {
+#     "key_columns": ["claim_id"],
+#     "source_where_clause": "created_date >= DATE '2026-01-01'",
+#     "target_where_clause": "created_date >= DATE '2026-01-01'",
+#     "row_hash_enabled": true,
+#     "row_limit": 1000000,
+#     "row_order_columns": ["claim_id"],
+#     "excluded_hash_columns": ["etl_loaded_ts"]
+#   },
+#   "claim_line": {
+#     "key_columns": ["claim_id", "line_no"],
+#     "row_hash_enabled": true,
+#     "row_limit": 500000
+#   }
+# }
+dbutils.widgets.text("table_config_json", "{}")
+
+# Global row-hash controls.
+dbutils.widgets.dropdown(
+    "row_hash_enabled_default", "false", ["true", "false"]
+)
+dbutils.widgets.text("row_hash_default_limit", "0")
+dbutils.widgets.text("max_mismatch_details_per_table", "100000")
+
+# Timezone interpretation.
+dbutils.widgets.text("source_timestamp_timezone", "Asia/Kolkata")
+dbutils.widgets.text("target_timestamp_timezone", "Asia/Kolkata")
+dbutils.widgets.text("comparison_timezone", "UTC")
+
+# Statistical comparison tolerances.
+dbutils.widgets.text("numeric_absolute_tolerance", "0.0")
+dbutils.widgets.text("numeric_relative_tolerance", "0.0")
+dbutils.widgets.text("timestamp_tolerance_seconds", "0")
+dbutils.widgets.text("median_accuracy", "10000")
+
+# Export.
+dbutils.widgets.text(
+    "export_base_path",
+    "dbfs:/FileStore/databricks_schema_validation"
+)
+
+# COMMAND ----------
+
+SOURCE_CATALOG = dbutils.widgets.get("source_catalog").strip()
+SOURCE_SCHEMA = dbutils.widgets.get("source_schema").strip()
+TARGET_CATALOG = dbutils.widgets.get("target_catalog").strip()
+TARGET_SCHEMA = dbutils.widgets.get("target_schema").strip()
+
+TABLES = [
+    x.strip()
+    for x in dbutils.widgets.get("table_list").split(",")
+    if x.strip()
+]
+TABLE_CONFIG_JSON = dbutils.widgets.get("table_config_json").strip() or "{}"
+
+ROW_HASH_ENABLED_DEFAULT = (
+    dbutils.widgets.get("row_hash_enabled_default").lower() == "true"
+)
+ROW_HASH_DEFAULT_LIMIT = int(
+    dbutils.widgets.get("row_hash_default_limit")
+)
+MAX_MISMATCH_DETAILS_PER_TABLE = int(
+    dbutils.widgets.get("max_mismatch_details_per_table")
+)
+
+SOURCE_TZ = dbutils.widgets.get("source_timestamp_timezone").strip()
+TARGET_TZ = dbutils.widgets.get("target_timestamp_timezone").strip()
+COMPARISON_TZ = dbutils.widgets.get("comparison_timezone").strip()
+
+NUM_ABS_TOL = float(dbutils.widgets.get("numeric_absolute_tolerance"))
+NUM_REL_TOL = float(dbutils.widgets.get("numeric_relative_tolerance"))
+TS_TOL_SEC = int(dbutils.widgets.get("timestamp_tolerance_seconds"))
+MEDIAN_ACCURACY = int(dbutils.widgets.get("median_accuracy"))
+
+EXPORT_BASE_PATH = dbutils.widgets.get(
+    "export_base_path"
+).strip().rstrip("/")
+
+if not all([SOURCE_CATALOG, SOURCE_SCHEMA, TARGET_CATALOG, TARGET_SCHEMA]):
+    raise ValueError(
+        "source_catalog, source_schema, target_catalog and target_schema are required."
+    )
+if not TABLES:
+    raise ValueError("table_list must contain at least one table.")
+
+try:
+    TABLE_CONFIG: Dict[str, dict] = json.loads(TABLE_CONFIG_JSON)
+except json.JSONDecodeError as exc:
+    raise ValueError(f"Invalid table_config_json: {exc}") from exc
+
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+RUN_ID = str(uuid.uuid4())
+RUN_TS = datetime.now(timezone.utc)
+RUN_FOLDER = (
+    f"{EXPORT_BASE_PATH}/"
+    f"{RUN_TS.strftime('%Y%m%d_%H%M%S')}_{RUN_ID[:8]}"
+)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 2. Helpers
+
+# COMMAND ----------
+
+def q(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
+
+
+def fqtn(catalog: str, schema: str, table: str) -> str:
+    return f"{q(catalog)}.{q(schema)}.{q(table)}"
+
+
+def cfg_for(table: str) -> dict:
+    lookup = {str(k).lower(): v for k, v in TABLE_CONFIG.items()}
+    cfg = lookup.get(table.lower(), {})
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Configuration for {table} must be a JSON object.")
+    return cfg
+
+
+def empty_df(schema: str) -> DataFrame:
+    return spark.createDataFrame([], schema=schema)
+
+
+def union_all(frames: Sequence[DataFrame], schema: str) -> DataFrame:
+    valid = [x for x in frames if x is not None]
+    if not valid:
+        return empty_df(schema)
+    return reduce(
+        lambda a, b: a.unionByName(b, allowMissingColumns=True),
+        valid,
+    )
+
+
+def read_table(
+    catalog: str,
+    schema: str,
+    table: str,
+    where_clause: str = "",
+) -> DataFrame:
+    df = spark.table(fqtn(catalog, schema, table))
+    return df.where(where_clause) if where_clause else df
+
+
+def write_single_csv(df: DataFrame, base: str) -> str:
+    tmp = base + "_tmp"
+    final = base + ".csv"
+    dbutils.fs.rm(tmp, True)
+    dbutils.fs.rm(final, True)
+
+    (
+        df.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .option("quoteAll", "true")
+        .csv(tmp)
+    )
+
+    parts = [
+        x.path for x in dbutils.fs.ls(tmp)
+        if x.name.startswith("part-") and x.name.endswith(".csv")
+    ]
+    if not parts:
+        raise RuntimeError(f"No CSV part file produced for {base}")
+
+    dbutils.fs.mv(parts[0], final)
+    dbutils.fs.rm(tmp, True)
+    return final
+
+
+def download_url(path: str) -> Optional[str]:
+    prefix = "dbfs:/FileStore/"
+    if path.startswith(prefix):
+        return "/files/" + path[len(prefix):]
+    return None
+
+
+def classify(field: T.StructField) -> str:
+    dt = field.dataType
+    if isinstance(
+        dt,
+        (
+            T.ByteType,
+            T.ShortType,
+            T.IntegerType,
+            T.LongType,
+            T.FloatType,
+            T.DoubleType,
+            T.DecimalType,
+        ),
+    ):
+        return "NUMERICAL"
+    if isinstance(dt, T.DateType):
+        return "DATE"
+    if isinstance(dt, T.TimestampNTZType):
+        return "TIMESTAMP_NTZ"
+    if isinstance(dt, T.TimestampType):
+        return "TIMESTAMP"
+    return "CATEGORICAL"
+
+
+def get_common_columns(
+    src: DataFrame,
+    tgt: DataFrame,
+) -> Dict[str, Tuple[T.StructField, T.StructField]]:
+    s = {f.name.lower(): f for f in src.schema.fields}
+    t = {f.name.lower(): f for f in tgt.schema.fields}
+    return {
+        name: (s[name], t[name])
+        for name in sorted(set(s) & set(t))
+    }
+
+
+def apply_volume(
+    df: DataFrame,
+    row_limit: int,
+    order_columns: Sequence[str],
+) -> DataFrame:
+    """
+    Applies a deterministic row limit when row_limit > 0.
+    For reliable comparison, row_order_columns should normally include the key columns.
+    """
+    if row_limit <= 0:
+        return df
+
+    if order_columns:
+        return df.orderBy(
+            *[F.col(q(c)) for c in order_columns]
+        ).limit(row_limit)
+
+    return df.limit(row_limit)
+
+
+def key_json_expr(alias: str, keys: Sequence[str]) -> F.Column:
+    return F.to_json(
+        F.struct(
+            *[
+                F.col(f"{alias}.{q(k)}").alias(k)
+                for k in keys
+            ]
+        ),
+        options={"ignoreNullFields": "false"},
+    )
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 3. Canonical value handling for row hashes
+
+# COMMAND ----------
+
+def canonical_value(
+    col_expr: F.Column,
+    data_type: T.DataType,
+    timezone_name: str,
+) -> F.Column:
+    """
+    Canonical string representation used in the SHA-256 row hash.
+    """
+    if isinstance(data_type, T.StringType):
+        return col_expr.cast("string")
+
+    if isinstance(data_type, T.BooleanType):
+        return col_expr.cast("boolean").cast("string")
+
+    if isinstance(
+        data_type,
+        (
+            T.ByteType,
+            T.ShortType,
+            T.IntegerType,
+            T.LongType,
+            T.FloatType,
+            T.DoubleType,
+            T.DecimalType,
+        ),
+    ):
+        return col_expr.cast("decimal(38,18)").cast("string")
+
+    if isinstance(data_type, T.DateType):
+        return F.date_format(col_expr.cast("date"), "yyyy-MM-dd")
+
+    if isinstance(data_type, T.TimestampNTZType):
+        utc_ts = F.to_utc_timestamp(
+            col_expr.cast("timestamp"),
+            timezone_name,
+        )
+        return F.date_format(
+            utc_ts,
+            "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'",
+        )
+
+    if isinstance(data_type, T.TimestampType):
+        return F.date_format(
+            col_expr.cast("timestamp"),
+            "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'",
+        )
+
+    if isinstance(data_type, T.BinaryType):
+        return F.base64(col_expr)
+
+    if isinstance(
+        data_type,
+        (T.ArrayType, T.MapType, T.StructType),
+    ):
+        return F.to_json(
+            col_expr,
+            options={"ignoreNullFields": "false"},
+        )
+
+    return col_expr.cast("string")
+
+
+def add_row_hash(
+    df: DataFrame,
+    columns: Sequence[str],
+    timezone_name: str,
+    hash_column: str,
+) -> DataFrame:
+    field_map = {f.name.lower(): f for f in df.schema.fields}
+
+    canonical = []
+    for c in columns:
+        field = field_map[c.lower()]
+        canonical.append(
+            F.coalesce(
+                canonical_value(
+                    F.col(q(field.name)),
+                    field.dataType,
+                    timezone_name,
+                ),
+                F.lit("∅"),
+            ).alias(field.name)
+        )
+
+    payload = F.to_json(
+        F.struct(*canonical),
+        options={"ignoreNullFields": "false"},
+    )
+    return (
+        df
+        .withColumn("__hash_payload", payload)
+        .withColumn(hash_column, F.sha2(F.col("__hash_payload"), 256))
+        .drop("__hash_payload")
+    )
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 4. Type-aware equality for mismatch-column drill-down
+
+# COMMAND ----------
+
+NUMERIC_TYPES = (
+    T.ByteType,
+    T.ShortType,
+    T.IntegerType,
+    T.LongType,
+    T.FloatType,
+    T.DoubleType,
+    T.DecimalType,
+)
+
+
+def values_equal(
+    src_col: F.Column,
+    tgt_col: F.Column,
+    src_type: T.DataType,
+    classification: str,
+) -> F.Column:
+    both_null = src_col.isNull() & tgt_col.isNull()
+    one_null = src_col.isNull() ^ tgt_col.isNull()
+
+    if isinstance(src_type, NUMERIC_TYPES):
+        s = src_col.cast("double")
+        t = tgt_col.cast("double")
+        abs_diff = F.abs(t - s)
+        denominator = F.greatest(
+            F.abs(s), F.abs(t), F.lit(1.0)
+        )
+        allowed = F.greatest(
+            F.lit(NUM_ABS_TOL),
+            F.lit(NUM_REL_TOL) * denominator,
+        )
+        equal_non_null = abs_diff <= allowed
+
+    elif classification == "TIMESTAMP_NTZ":
+        s = F.to_utc_timestamp(
+            src_col.cast("timestamp"),
+            SOURCE_TZ,
+        ).cast("double")
+        t = F.to_utc_timestamp(
+            tgt_col.cast("timestamp"),
+            TARGET_TZ,
+        ).cast("double")
+        equal_non_null = F.abs(t - s) <= F.lit(TS_TOL_SEC)
+
+    elif classification == "TIMESTAMP":
+        equal_non_null = (
+            F.abs(
+                tgt_col.cast("timestamp").cast("double")
+                - src_col.cast("timestamp").cast("double")
+            )
+            <= F.lit(TS_TOL_SEC)
+        )
+
+    else:
+        equal_non_null = src_col.eqNullSafe(tgt_col)
+
+    return (
+        F.when(both_null, F.lit(True))
+        .when(one_null, F.lit(False))
+        .otherwise(equal_non_null)
+    )
+
+
+def display_value(
+    col_expr: F.Column,
+    data_type: T.DataType,
+    timezone_name: str,
+) -> F.Column:
+    return canonical_value(col_expr, data_type, timezone_name)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 5. Row-hash result schemas
+
+# COMMAND ----------
+
+ROW_HASH_SUMMARY_SCHEMA = """
+    run_id string,
+    table_name string,
+    requested_row_limit long,
+    source_rows_hashed long,
+    target_rows_hashed long,
+    source_only_rows long,
+    target_only_rows long,
+    equal_hash_rows long,
+    changed_hash_rows long,
+    hash_match_pct double,
+    status string,
+    run_ts timestamp
+"""
+
+ROW_STATUS_SCHEMA = """
+    run_id string,
+    table_name string,
+    key_json string,
+    record_status string,
+    source_row_hash string,
+    target_row_hash string,
+    run_ts timestamp
+"""
+
+MISMATCH_DETAIL_SCHEMA = """
+    run_id string,
+    table_name string,
+    key_json string,
+    mismatch_column string,
+    mismatch_type string,
+    source_value string,
+    target_value string,
+    source_row_hash string,
+    target_row_hash string,
+    run_ts timestamp
+"""
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 6. Row-hash comparison
+
+# COMMAND ----------
+
+def row_hash_compare(
+    table: str,
+    source_df: DataFrame,
+    target_df: DataFrame,
+    cfg: dict,
+) -> Tuple[DataFrame, DataFrame, DataFrame]:
+    keys = [str(x) for x in cfg.get("key_columns", [])]
+    if not keys:
+        raise ValueError(
+            f"{table}: row_hash_enabled requires key_columns."
+        )
+
+    src_cols = {c.lower(): c for c in source_df.columns}
+    tgt_cols = {c.lower(): c for c in target_df.columns}
+
+    missing_src = [k for k in keys if k.lower() not in src_cols]
+    missing_tgt = [k for k in keys if k.lower() not in tgt_cols]
+    if missing_src or missing_tgt:
+        raise ValueError(
+            f"{table}: missing keys; source={missing_src}, target={missing_tgt}"
+        )
+
+    # Use exact source spelling as logical key spelling.
+    keys = [src_cols[k.lower()] for k in keys]
+
+    excluded = {
+        str(x).lower()
+        for x in cfg.get("excluded_hash_columns", [])
+    }
+
+    common = get_common_columns(source_df, target_df)
+    hash_columns = [
+        pair[0].name
+        for name, pair in common.items()
+        if name not in excluded
+    ]
+
+    # Keys are used for joining, not as part of change detection.
+    non_key_hash_columns = [
+        c for c in hash_columns
+        if c.lower() not in {k.lower() for k in keys}
+    ]
+
+    if not non_key_hash_columns:
+        raise ValueError(
+            f"{table}: no common non-key columns available for row hashing."
+        )
+
+    row_limit = int(
+        cfg.get("row_limit", ROW_HASH_DEFAULT_LIMIT)
+    )
+    order_columns = [
+        str(x)
+        for x in cfg.get("row_order_columns", keys)
+    ]
+
+    source_limited = apply_volume(
+        source_df,
+        row_limit,
+        order_columns,
+    )
+    target_limited = apply_volume(
+        target_df,
+        row_limit,
+        order_columns,
+    )
+
+    source_count = source_limited.count()
+    target_count = target_limited.count()
+
+    source_hashed = add_row_hash(
+        source_limited,
+        non_key_hash_columns,
+        SOURCE_TZ,
+        "__source_hash",
+    ).alias("s")
+
+    target_hashed = add_row_hash(
+        target_limited,
+        [
+            common[c.lower()][1].name
+            for c in non_key_hash_columns
+        ],
+        TARGET_TZ,
+        "__target_hash",
+    ).alias("t")
+
+    join_condition = reduce(
+        lambda a, b: a & b,
+        [
+            F.col(f"s.{q(src_cols[k.lower()])}").eqNullSafe(
+                F.col(f"t.{q(tgt_cols[k.lower()])}")
+            )
+            for k in keys
+        ],
+    )
+
+    joined = source_hashed.join(
+        target_hashed,
+        join_condition,
+        "fullouter",
+    )
+
+    source_exists = F.col("s.__source_hash").isNotNull()
+    target_exists = F.col("t.__target_hash").isNotNull()
+
+    record_status = (
+        F.when(source_exists & ~target_exists, "SOURCE_ONLY")
+        .when(~source_exists & target_exists, "TARGET_ONLY")
+        .when(
+            F.col("s.__source_hash") == F.col("t.__target_hash"),
+            "MATCH",
+        )
+        .otherwise("CHANGED")
+    )
+
+    # Build a key JSON that works even for source-only / target-only rows.
+    key_struct_fields = []
+    for key in keys:
+        s_key = src_cols[key.lower()]
+        t_key = tgt_cols[key.lower()]
+        key_struct_fields.append(
+            F.coalesce(
+                F.col(f"s.{q(s_key)}"),
+                F.col(f"t.{q(t_key)}"),
+            ).alias(key)
+        )
+
+    key_json = F.to_json(
+        F.struct(*key_struct_fields),
+        options={"ignoreNullFields": "false"},
+    )
+
+    row_status = joined.select(
+        F.lit(RUN_ID).alias("run_id"),
+        F.lit(table).alias("table_name"),
+        key_json.alias("key_json"),
+        record_status.alias("record_status"),
+        F.col("s.__source_hash").alias("source_row_hash"),
+        F.col("t.__target_hash").alias("target_row_hash"),
+        F.lit(RUN_TS).cast("timestamp").alias("run_ts"),
+    )
+
+    counts = (
+        row_status.groupBy()
+        .agg(
+            F.sum(
+                F.when(F.col("record_status") == "SOURCE_ONLY", 1).otherwise(0)
+            ).alias("source_only_rows"),
+            F.sum(
+                F.when(F.col("record_status") == "TARGET_ONLY", 1).otherwise(0)
+            ).alias("target_only_rows"),
+            F.sum(
+                F.when(F.col("record_status") == "MATCH", 1).otherwise(0)
+            ).alias("equal_hash_rows"),
+            F.sum(
+                F.when(F.col("record_status") == "CHANGED", 1).otherwise(0)
+            ).alias("changed_hash_rows"),
+        )
+        .first()
+        .asDict()
+    )
+
+    equal_rows = int(counts["equal_hash_rows"] or 0)
+    changed_rows = int(counts["changed_hash_rows"] or 0)
+    src_only = int(counts["source_only_rows"] or 0)
+    tgt_only = int(counts["target_only_rows"] or 0)
+    denominator = max(source_count, target_count, 1)
+    match_pct = equal_rows / denominator * 100.0
+
+    summary = spark.createDataFrame(
+        [{
+            "run_id": RUN_ID,
+            "table_name": table,
+            "requested_row_limit": row_limit,
+            "source_rows_hashed": source_count,
+            "target_rows_hashed": target_count,
+            "source_only_rows": src_only,
+            "target_only_rows": tgt_only,
+            "equal_hash_rows": equal_rows,
+            "changed_hash_rows": changed_rows,
+            "hash_match_pct": match_pct,
+            "status": (
+                "PASS"
+                if src_only == 0 and tgt_only == 0 and changed_rows == 0
+                else "FAIL"
+            ),
+            "run_ts": RUN_TS,
+        }],
+        schema=ROW_HASH_SUMMARY_SCHEMA,
+    )
+
+    # Drill-down only changed rows. Source-only/target-only records are already
+    # available in row_status with their keys.
+    changed_joined = joined.where(
+        source_exists
+        & target_exists
+        & (F.col("s.__source_hash") != F.col("t.__target_hash"))
+    )
+
+    detail_frames: List[DataFrame] = []
+
+    for logical_name, (sf, tf) in common.items():
+        if logical_name in excluded:
+            continue
+        if sf.name.lower() in {k.lower() for k in keys}:
+            continue
+
+        src_value = F.col(f"s.{q(sf.name)}")
+        tgt_value = F.col(f"t.{q(tf.name)}")
+        classification = classify(sf)
+        equal_expr = values_equal(
+            src_value,
+            tgt_value,
+            sf.dataType,
+            classification,
+        )
+
+        detail = (
+            changed_joined
+            .where(~equal_expr)
+            .select(
+                F.lit(RUN_ID).alias("run_id"),
+                F.lit(table).alias("table_name"),
+                key_json.alias("key_json"),
+                F.lit(sf.name).alias("mismatch_column"),
+                F.when(
+                    src_value.isNull() & tgt_value.isNotNull(),
+                    F.lit("SOURCE_NULL"),
+                )
+                .when(
+                    src_value.isNotNull() & tgt_value.isNull(),
+                    F.lit("TARGET_NULL"),
+                )
+                .otherwise(F.lit("VALUE_MISMATCH"))
+                .alias("mismatch_type"),
+                display_value(
+                    src_value,
+                    sf.dataType,
+                    SOURCE_TZ,
+                ).alias("source_value"),
+                display_value(
+                    tgt_value,
+                    tf.dataType,
+                    TARGET_TZ,
+                ).alias("target_value"),
+                F.col("s.__source_hash").alias("source_row_hash"),
+                F.col("t.__target_hash").alias("target_row_hash"),
+                F.lit(RUN_TS).cast("timestamp").alias("run_ts"),
+            )
+        )
+        detail_frames.append(detail)
+
+    mismatch_detail = union_all(
+        detail_frames,
+        MISMATCH_DETAIL_SCHEMA,
+    )
+
+    if MAX_MISMATCH_DETAILS_PER_TABLE > 0:
+        mismatch_detail = mismatch_detail.limit(
+            MAX_MISMATCH_DETAILS_PER_TABLE
+        )
+
+    return summary, row_status, mismatch_detail
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 7. Existing statistical validation
+
+# COMMAND ----------
+
+COUNT_SCHEMA = """
+    run_id string,
+    table_name string,
+    source_row_count long,
+    target_row_count long,
+    difference long,
+    status string,
+    run_ts timestamp
+"""
+
+SCHEMA_SCHEMA = """
+    run_id string,
+    table_name string,
+    column_name string,
+    source_data_type string,
+    target_data_type string,
+    classification string,
+    status string,
+    run_ts timestamp
+"""
+
+CATEGORY_SCHEMA = """
+    run_id string,
+    table_name string,
+    column_name string,
+    category_value string,
+    source_count long,
+    target_count long,
+    difference long,
+    source_distinct_count long,
+    target_distinct_count long,
+    status string,
+    run_ts timestamp
+"""
+
+NUMERIC_SCHEMA = """
+    run_id string,
+    table_name string,
+    column_name string,
+    statistic_name string,
+    source_value double,
+    target_value double,
+    absolute_difference double,
+    status string,
+    run_ts timestamp
+"""
+
+DATETIME_SCHEMA = """
+    run_id string,
+    table_name string,
+    column_name string,
+    statistic_name string,
+    source_value string,
+    target_value string,
+    difference_seconds double,
+    status string,
+    run_ts timestamp
+"""
+
+
+def statistical_compare(
+    table: str,
+    src: DataFrame,
+    tgt: DataFrame,
+) -> Tuple[DataFrame, DataFrame, DataFrame, DataFrame, DataFrame]:
+    src_count = src.count()
+    tgt_count = tgt.count()
+
+    count_df = spark.createDataFrame(
+        [{
+            "run_id": RUN_ID,
+            "table_name": table,
+            "source_row_count": src_count,
+            "target_row_count": tgt_count,
+            "difference": tgt_count - src_count,
+            "status": "PASS" if src_count == tgt_count else "FAIL",
+            "run_ts": RUN_TS,
+        }],
+        COUNT_SCHEMA,
+    )
+
+    common = get_common_columns(src, tgt)
+
+    schema_rows = []
+    for name in sorted(
+        set(f.name.lower() for f in src.schema.fields)
+        | set(f.name.lower() for f in tgt.schema.fields)
+    ):
+        sf = next(
+            (f for f in src.schema.fields if f.name.lower() == name),
+            None,
+        )
+        tf = next(
+            (f for f in tgt.schema.fields if f.name.lower() == name),
+            None,
+        )
+
+        if sf is None:
+            status = "TARGET_ONLY_COLUMN"
+            cls = classify(tf)
+        elif tf is None:
+            status = "SOURCE_ONLY_COLUMN"
+            cls = classify(sf)
+        elif sf.dataType.simpleString() != tf.dataType.simpleString():
+            status = "TYPE_MISMATCH"
+            cls = classify(sf)
+        else:
+            status = "PASS"
+            cls = classify(sf)
+
+        schema_rows.append({
+            "run_id": RUN_ID,
+            "table_name": table,
+            "column_name": name,
+            "source_data_type": sf.dataType.simpleString() if sf else None,
+            "target_data_type": tf.dataType.simpleString() if tf else None,
+            "classification": cls,
+            "status": status,
+            "run_ts": RUN_TS,
+        })
+
+    schema_df = spark.createDataFrame(schema_rows, SCHEMA_SCHEMA)
+
+    category_frames = []
+    numeric_rows = []
+    datetime_rows = []
+
+    for _, (sf, tf) in common.items():
+        if sf.dataType.simpleString() != tf.dataType.simpleString():
+            continue
+
+        cls = classify(sf)
+
+        if cls == "CATEGORICAL":
+            s_distinct = src.select(F.col(q(sf.name))).distinct().count()
+            t_distinct = tgt.select(F.col(q(tf.name))).distinct().count()
+
+            sc = (
+                src.groupBy(
+                    F.coalesce(
+                        F.col(q(sf.name)).cast("string"),
+                        F.lit("<NULL>")
+                    ).alias("category_value")
+                )
+                .count()
+                .withColumnRenamed("count", "source_count")
+            )
+            tc = (
+                tgt.groupBy(
+                    F.coalesce(
+                        F.col(q(tf.name)).cast("string"),
+                        F.lit("<NULL>")
+                    ).alias("category_value")
+                )
+                .count()
+                .withColumnRenamed("count", "target_count")
+            )
+
+            category_frames.append(
+                sc.join(tc, "category_value", "full")
+                .select(
+                    F.lit(RUN_ID).alias("run_id"),
+                    F.lit(table).alias("table_name"),
+                    F.lit(sf.name).alias("column_name"),
+                    F.col("category_value"),
+                    F.coalesce(F.col("source_count"), F.lit(0)).cast("long")
+                        .alias("source_count"),
+                    F.coalesce(F.col("target_count"), F.lit(0)).cast("long")
+                        .alias("target_count"),
+                    (
+                        F.coalesce(F.col("target_count"), F.lit(0))
+                        - F.coalesce(F.col("source_count"), F.lit(0))
+                    ).cast("long").alias("difference"),
+                    F.lit(s_distinct).cast("long")
+                        .alias("source_distinct_count"),
+                    F.lit(t_distinct).cast("long")
+                        .alias("target_distinct_count"),
+                    F.when(
+                        F.coalesce(F.col("source_count"), F.lit(0))
+                        == F.coalesce(F.col("target_count"), F.lit(0)),
+                        "PASS",
+                    ).otherwise("FAIL").alias("status"),
+                    F.lit(RUN_TS).cast("timestamp").alias("run_ts"),
+                )
+            )
+
+        elif cls == "NUMERICAL":
+            def nstats(df, col):
+                c = F.col(q(col)).cast("double")
+                return df.agg(
+                    F.min(c).alias("MIN"),
+                    F.max(c).alias("MAX"),
+                    F.sum(c).alias("SUM"),
+                    F.expr(
+                        f"percentile_approx(cast({q(col)} as double), "
+                        f"0.5, {MEDIAN_ACCURACY})"
+                    ).alias("MEDIAN"),
+                ).first().asDict()
+
+            ss = nstats(src, sf.name)
+            ts = nstats(tgt, tf.name)
+
+            for stat in ["MIN", "MAX", "SUM", "MEDIAN"]:
+                sv, tv = ss[stat], ts[stat]
+                if sv is None and tv is None:
+                    diff, status = None, "PASS"
+                elif sv is None or tv is None:
+                    diff, status = None, "FAIL"
+                else:
+                    diff = abs(float(tv) - float(sv))
+                    denom = max(abs(float(sv)), abs(float(tv)), 1.0)
+                    allowed = max(NUM_ABS_TOL, NUM_REL_TOL * denom)
+                    status = "PASS" if diff <= allowed else "FAIL"
+
+                numeric_rows.append({
+                    "run_id": RUN_ID,
+                    "table_name": table,
+                    "column_name": sf.name,
+                    "statistic_name": stat,
+                    "source_value": None if sv is None else float(sv),
+                    "target_value": None if tv is None else float(tv),
+                    "absolute_difference": diff,
+                    "status": status,
+                    "run_ts": RUN_TS,
+                })
+
+        elif cls in {"DATE", "TIMESTAMP_NTZ", "TIMESTAMP"}:
+            if cls == "DATE":
+                se = F.col(q(sf.name)).cast("date")
+                te = F.col(q(tf.name)).cast("date")
+            elif cls == "TIMESTAMP_NTZ":
+                se = F.to_utc_timestamp(
+                    F.col(q(sf.name)).cast("timestamp"), SOURCE_TZ
+                )
+                te = F.to_utc_timestamp(
+                    F.col(q(tf.name)).cast("timestamp"), TARGET_TZ
+                )
+            else:
+                se = F.col(q(sf.name)).cast("timestamp")
+                te = F.col(q(tf.name)).cast("timestamp")
+
+            ss = src.agg(F.min(se).alias("MIN"), F.max(se).alias("MAX")).first().asDict()
+            ts = tgt.agg(F.min(te).alias("MIN"), F.max(te).alias("MAX")).first().asDict()
+
+            for stat in ["MIN", "MAX"]:
+                sv, tv = ss[stat], ts[stat]
+
+                if sv is None and tv is None:
+                    seconds, status = None, "PASS"
+                elif sv is None or tv is None:
+                    seconds, status = None, "FAIL"
+                elif cls == "DATE":
+                    seconds = (tv.toordinal() - sv.toordinal()) * 86400.0
+                    status = "PASS" if sv == tv else "FAIL"
+                else:
+                    seconds = tv.timestamp() - sv.timestamp()
+                    status = "PASS" if abs(seconds) <= TS_TOL_SEC else "FAIL"
+
+                datetime_rows.append({
+                    "run_id": RUN_ID,
+                    "table_name": table,
+                    "column_name": sf.name,
+                    "statistic_name": stat,
+                    "source_value": None if sv is None else str(sv),
+                    "target_value": None if tv is None else str(tv),
+                    "difference_seconds": seconds,
+                    "status": status,
+                    "run_ts": RUN_TS,
+                })
+
+    return (
+        count_df,
+        schema_df,
+        union_all(category_frames, CATEGORY_SCHEMA),
+        spark.createDataFrame(numeric_rows, NUMERIC_SCHEMA)
+            if numeric_rows else empty_df(NUMERIC_SCHEMA),
+        spark.createDataFrame(datetime_rows, DATETIME_SCHEMA)
+            if datetime_rows else empty_df(DATETIME_SCHEMA),
+    )
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 8. Execute all configured tables
+
+# COMMAND ----------
+
+count_frames = []
+schema_frames = []
+category_frames = []
+numeric_frames = []
+datetime_frames = []
+
+row_hash_summary_frames = []
+row_status_frames = []
+mismatch_detail_frames = []
+
+execution_rows = []
+
+for table in TABLES:
+    print(f"Processing {table}")
+    cfg = cfg_for(table)
+
+    try:
+        src = read_table(
+            SOURCE_CATALOG,
+            SOURCE_SCHEMA,
+            table,
+            str(cfg.get("source_where_clause", "")).strip(),
+        )
+        tgt = read_table(
+            TARGET_CATALOG,
+            TARGET_SCHEMA,
+            table,
+            str(cfg.get("target_where_clause", "")).strip(),
+        )
+
+        c, s, cat, num, dt = statistical_compare(
+            table, src, tgt
+        )
+        count_frames.append(c)
+        schema_frames.append(s)
+        category_frames.append(cat)
+        numeric_frames.append(num)
+        datetime_frames.append(dt)
+
+        hash_enabled = bool(
+            cfg.get(
+                "row_hash_enabled",
+                ROW_HASH_ENABLED_DEFAULT,
+            )
+        )
+
+        if hash_enabled:
+            hsum, hrows, hdetail = row_hash_compare(
+                table,
+                src,
+                tgt,
+                cfg,
+            )
+            row_hash_summary_frames.append(hsum)
+            row_status_frames.append(hrows)
+            mismatch_detail_frames.append(hdetail)
+
+        execution_rows.append({
+            "run_id": RUN_ID,
+            "table_name": table,
+            "status": "COMPLETED",
+            "message": None,
+            "run_ts": RUN_TS,
+        })
+
+    except Exception as exc:
+        execution_rows.append({
+            "run_id": RUN_ID,
+            "table_name": table,
+            "status": "FAILED",
+            "message": f"{type(exc).__name__}: {str(exc)}"[:10000],
+            "run_ts": RUN_TS,
+        })
+        print(f"{table} FAILED: {type(exc).__name__}: {exc}")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 9. Consolidated result tables
+
+# COMMAND ----------
+
+count_result = union_all(count_frames, COUNT_SCHEMA)
+schema_result = union_all(schema_frames, SCHEMA_SCHEMA)
+category_result = union_all(category_frames, CATEGORY_SCHEMA)
+numeric_result = union_all(numeric_frames, NUMERIC_SCHEMA)
+datetime_result = union_all(datetime_frames, DATETIME_SCHEMA)
+
+row_hash_summary_result = union_all(
+    row_hash_summary_frames,
+    ROW_HASH_SUMMARY_SCHEMA,
+)
+row_status_result = union_all(
+    row_status_frames,
+    ROW_STATUS_SCHEMA,
+)
+mismatch_detail_result = union_all(
+    mismatch_detail_frames,
+    MISMATCH_DETAIL_SCHEMA,
+)
+
+execution_result = spark.createDataFrame(
+    execution_rows,
+    """
+    run_id string,
+    table_name string,
+    status string,
+    message string,
+    run_ts timestamp
+    """,
+)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 10. Display row-hash validation
+
+# COMMAND ----------
+
+print("ROW HASH SUMMARY")
+display(
+    row_hash_summary_result.orderBy("table_name")
+)
+
+# COMMAND ----------
+
+print("MISMATCHED / MISSING RECORD KEYS")
+display(
+    row_status_result
+    .where(F.col("record_status") != "MATCH")
+    .orderBy("table_name", "key_json")
+)
+
+# COMMAND ----------
+
+print("COLUMN-LEVEL MISMATCH DETAILS")
+display(
+    mismatch_detail_result.orderBy(
+        "table_name",
+        "key_json",
+        "mismatch_column",
+    )
+)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 11. Display statistical reports
+
+# COMMAND ----------
+
+display(execution_result.orderBy("table_name"))
+
+# COMMAND ----------
+
+display(count_result.orderBy("table_name"))
+
+# COMMAND ----------
+
+display(schema_result.orderBy("table_name", "column_name"))
+
+# COMMAND ----------
+
+display(category_result.orderBy("table_name", "column_name"))
+
+# COMMAND ----------
+
+display(numeric_result.orderBy("table_name", "column_name", "statistic_name"))
+
+# COMMAND ----------
+
+display(datetime_result.orderBy("table_name", "column_name", "statistic_name"))
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 12. Export CSV reports
+
+# COMMAND ----------
+
+dbutils.fs.mkdirs(RUN_FOLDER)
+
+reports = {
+    "01_execution_status": execution_result,
+    "02_total_counts": count_result,
+    "03_schema_comparison": schema_result,
+    "04_categorical_comparison": category_result,
+    "05_numerical_statistics": numeric_result,
+    "06_datetime_statistics": datetime_result,
+    "07_row_hash_summary": row_hash_summary_result,
+    "08_row_status_mismatches": row_status_result.where(
+        F.col("record_status") != "MATCH"
+    ),
+    "09_column_mismatch_details": mismatch_detail_result,
+}
+
+download_rows = []
+
+for name, df in reports.items():
+    path = write_single_csv(df, f"{RUN_FOLDER}/{name}")
+    download_rows.append({
+        "report_name": name,
+        "dbfs_path": path,
+        "download_url": download_url(path),
+    })
+
+download_df = spark.createDataFrame(download_rows)
+
+print(f"Run ID: {RUN_ID}")
+print(f"Output folder: {RUN_FOLDER}")
+display(download_df)
+
+# COMMAND ----------
+
+links = []
+for x in download_rows:
+    if x["download_url"]:
+        links.append(
+            f'<li><a href="{x["download_url"]}" target="_blank">'
+            f'Download {x["report_name"]}.csv</a></li>'
+        )
+    else:
+        links.append(
+            f'<li>{x["report_name"]}: {x["dbfs_path"]}</li>'
+        )
+
+displayHTML(
+    "<h3>Validation CSV Downloads</h3><ul>"
+    + "".join(links)
+    + "</ul>"
+)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Example row-hash configuration
+# MAGIC
+# MAGIC ```json
+# MAGIC {
+# MAGIC   "claims": {
+# MAGIC     "key_columns": ["claim_id"],
+# MAGIC     "row_hash_enabled": true,
+# MAGIC     "row_limit": 1000000,
+# MAGIC     "row_order_columns": ["claim_id"],
+# MAGIC     "excluded_hash_columns": ["etl_loaded_ts"]
+# MAGIC   },
+# MAGIC   "claim_line": {
+# MAGIC     "key_columns": ["claim_id", "line_no"],
+# MAGIC     "row_hash_enabled": true,
+# MAGIC     "row_limit": 500000,
+# MAGIC     "row_order_columns": ["claim_id", "line_no"]
+# MAGIC   }
+# MAGIC }
+# MAGIC ```
+# MAGIC
+# MAGIC `row_limit = 0` means all rows.
+# MAGIC
+# MAGIC The two most important drill-down outputs are:
+# MAGIC
+# MAGIC - `08_row_status_mismatches.csv`: keys for SOURCE_ONLY, TARGET_ONLY and CHANGED records.
+# MAGIC - `09_column_mismatch_details.csv`: one row per mismatching column, including key JSON, source value and target value.
